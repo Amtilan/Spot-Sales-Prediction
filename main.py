@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from datetime import datetime
-from typing import List, Optional, Dict
+from pydantic import BaseModel, validator
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Literal
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
@@ -27,18 +27,29 @@ df = None
 class PredictionRequest(BaseModel):
     area: str
     target_date: str
+    range: Literal["1d", "1w", "2w", "1m"]
+
+    @validator("target_date")
+    def validate_date(cls, v):
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+            return v
+        except ValueError:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD")
 
 class PredictionItem(BaseModel):
     Category: str
     Item: str
     Type_of_Order: str
     Predicted_Orders: int
+    Date: str
 
 class PredictionResponse(BaseModel):
     predictions: List[PredictionItem]
     total_orders: int
     area: str
-    target_date: str
+    date_range: Dict[str, str]
+    daily_totals: Dict[str, int]
 
 class MenuResponse(BaseModel):
     categories: Dict[str, List[str]]
@@ -90,7 +101,23 @@ def train_area_models(df):
     
     return models
 
-def predict_for_area(df, area: str, target_date: str) -> Optional[pd.DataFrame]:
+def get_date_range(target_date: str, range_type: str) -> List[datetime]:
+    start_date = datetime.strptime(target_date, "%Y-%m-%d")
+    
+    range_mappings = {
+        "1d": timedelta(days=1),
+        "1w": timedelta(weeks=1),
+        "2w": timedelta(weeks=2),
+        "1m": timedelta(days=30)
+    }
+    
+    delta = range_mappings[range_type]
+    end_date = start_date + delta
+    
+    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+    return date_range
+
+def predict_for_area_and_range(df: pd.DataFrame, area: str, target_date: str, range_type: str) -> Optional[pd.DataFrame]:
     area_data = df[df['Area'] == area].copy()
     
     if len(area_data) == 0:
@@ -98,35 +125,34 @@ def predict_for_area(df, area: str, target_date: str) -> Optional[pd.DataFrame]:
     
     menu_items = get_menu_items(df)
     models = train_area_models(area_data)
+    date_range = get_date_range(target_date, range_type)
     
-    try:
-        pred_date = pd.to_datetime(target_date)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    all_predictions = []
     
-    pred_features = pd.DataFrame({
-        'Year': [pred_date.year],
-        'Month': [pred_date.month],
-        'DayOfWeek': [pred_date.dayofweek],
-        'DayOfMonth': [pred_date.day]
-    })
+    for pred_date in date_range:
+        pred_features = pd.DataFrame({
+            'Year': [pred_date.year],
+            'Month': [pred_date.month],
+            'DayOfWeek': [pred_date.dayofweek],
+            'DayOfMonth': [pred_date.day]
+        })
+        
+        for category, items in menu_items.items():
+            for item in items:
+                for order_type in ['Takeaway', 'Dining']:
+                    model_key = (item, order_type)
+                    if model_key in models:
+                        prediction = models[model_key].predict(pred_features)[0]
+                        if prediction > 0:
+                            all_predictions.append({
+                                'Category': category,
+                                'Item': item,
+                                'Type_of_Order': order_type,
+                                'Predicted_Orders': max(0, round(prediction)),
+                                'Date': pred_date.strftime('%Y-%m-%d')
+                            })
     
-    predictions = []
-    for category, items in menu_items.items():
-        for item in items:
-            for order_type in ['Takeaway', 'Dining']:
-                model_key = (item, order_type)
-                if model_key in models:
-                    prediction = models[model_key].predict(pred_features)[0]
-                    if prediction > 0:
-                        predictions.append({
-                            'Category': category,
-                            'Item': item,
-                            'Type_of_Order': order_type,
-                            'Predicted_Orders': max(0, round(prediction))
-                        })
-    
-    return pd.DataFrame(predictions)
+    return pd.DataFrame(all_predictions)
 
 # Endpoints
 @app.get("/last_date")
@@ -169,14 +195,30 @@ async def get_menu_items_endpoint():
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    """Get predictions for a specific area and date"""
+    """Get predictions for a specific area and date range"""
     if df is None:
         raise HTTPException(status_code=500, detail="Data not loaded")
     
-    predictions_df = predict_for_area(df, request.area, request.target_date)
+    predictions_df = predict_for_area_and_range(
+        df, 
+        request.area, 
+        request.target_date, 
+        request.range
+    )
     
     if predictions_df is None:
         raise HTTPException(status_code=404, detail=f"No data available for area: {request.area}")
+    
+    # Calculate date range
+    date_range = get_date_range(request.target_date, request.range)
+    date_range_dict = {
+        "start_date": date_range[0].strftime('%Y-%m-%d'),
+        "end_date": date_range[-1].strftime('%Y-%m-%d')
+    }
+    
+    # Calculate daily totals
+    daily_totals = predictions_df.groupby('Date')['Predicted_Orders'].sum().to_dict()
+    daily_totals = {str(k): int(v) for k, v in daily_totals.items()}
     
     # Convert predictions to response format
     predictions_list = predictions_df.to_dict('records')
@@ -186,8 +228,27 @@ async def predict(request: PredictionRequest):
         predictions=predictions_list,
         total_orders=total_orders,
         area=request.area,
-        target_date=request.target_date
+        date_range=date_range_dict,
+        daily_totals=daily_totals
     )
+
+# Set up scheduler to reload data daily
+@app.on_event("startup")
+async def startup_event():
+    # Load initial data
+    load_data()
+    
+    # Schedule data reload
+    scheduler.add_job(
+        load_data,
+        trigger=CronTrigger(hour=0),  # Run at midnight
+        id='reload_data'
+    )
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
