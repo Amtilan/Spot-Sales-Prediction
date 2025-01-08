@@ -1,13 +1,14 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, validator
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Literal
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sklearn.ensemble import RandomForestRegressor
+from typing import List, Optional, Dict, Literal
+from pydantic import BaseModel, validator
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import uvicorn
 import logging
 
 # Set up logging
@@ -22,6 +23,24 @@ scheduler = BackgroundScheduler()
 
 # Global DataFrame
 df = None
+
+# CORS
+origins = [
+    "https://localhost:3000",
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Cache dictionary to store predictions
+cache: Dict[str, Dict] = {}
+CACHE_EXPIRATION_HOURS = 24  # Expire cached items after 1 day
 
 # Pydantic models
 class PredictionRequest(BaseModel):
@@ -154,6 +173,16 @@ def predict_for_area_and_range(df: pd.DataFrame, area: str, target_date: str, ra
     
     return pd.DataFrame(all_predictions)
 
+# Function to clean expired cache entries
+def clean_cache():
+    current_time = datetime.now()
+    keys_to_delete = [
+        key for key, value in cache.items()
+        if value['expiration'] < current_time
+    ]
+    for key in keys_to_delete:
+        del cache[key]
+
 # Endpoints
 @app.get("/last_date")
 async def get_last_date():
@@ -195,10 +224,26 @@ async def get_menu_items_endpoint():
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    """Get predictions for a specific area and date range"""
+    """Get predictions for a specific area and date range with caching"""
     if df is None:
         raise HTTPException(status_code=500, detail="Data not loaded")
     
+    # Generate a cache key
+    cache_key = f"{request.area}_{request.target_date}_{request.range}"
+    
+    # Check the cache
+    if cache_key in cache:
+        cached_response = cache[cache_key]
+        if cached_response['expiration'] > datetime.now():
+            logger.info("Cache hit for key: %s", cache_key)
+            return cached_response['data']
+        else:
+            # Expired cache
+            del cache[cache_key]
+    
+    logger.info("Cache miss for key: %s", cache_key)
+    
+    # Perform the prediction
     predictions_df = predict_for_area_and_range(
         df, 
         request.area, 
@@ -224,14 +269,21 @@ async def predict(request: PredictionRequest):
     predictions_list = predictions_df.to_dict('records')
     total_orders = int(predictions_df['Predicted_Orders'].sum())
     
-    return PredictionResponse(
+    response = PredictionResponse(
         predictions=predictions_list,
         total_orders=total_orders,
         area=request.area,
         date_range=date_range_dict,
         daily_totals=daily_totals
     )
-
+    
+    # Store response in cache
+    cache[cache_key] = {
+        "data": response,
+        "expiration": datetime.now() + timedelta(hours=CACHE_EXPIRATION_HOURS)
+    }
+    
+    return response
 # Set up scheduler to reload data daily
 @app.on_event("startup")
 async def startup_event():
