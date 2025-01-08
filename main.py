@@ -10,8 +10,9 @@ import pandas as pd
 import numpy as np
 import uvicorn
 import logging
+from threading import Lock
 
-# Set up logging
+# Initialize logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -21,13 +22,10 @@ app = FastAPI(title="Restaurant Order Prediction API")
 # Initialize scheduler
 scheduler = BackgroundScheduler()
 
-# Global DataFrame
-df = None
-
-# CORS
+# CORS settings
 origins = [
-    "https://localhost:3000",
     "http://localhost:3000",
+    "https://localhost:3000",
 ]
 
 app.add_middleware(
@@ -38,9 +36,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache dictionary to store predictions
+# Global resources
+data_lock = Lock()
+df = None
+models = None
 cache: Dict[str, Dict] = {}
-CACHE_EXPIRATION_HOURS = 24  # Expire cached items after 1 day
+CACHE_EXPIRATION_HOURS = 24  # Cache expiration
 
 # Pydantic models
 class PredictionRequest(BaseModel):
@@ -74,29 +75,23 @@ class MenuResponse(BaseModel):
     categories: Dict[str, List[str]]
     total_items: int
 
-# Data loading function
+# Data loading and preparation
 def load_data():
-    global df
+    global df, models
     try:
-        logger.info("Starting data reload...")
-        new_df = pd.read_csv('the_burger_spot.csv')
-        new_df = load_and_prepare_data(new_df)
+        logger.info("Reloading data...")
+        new_df = pd.read_csv("the_burger_spot.csv")
+        new_df['Date'] = pd.to_datetime(new_df['Date'])
         df = new_df
-        logger.info("Data reload completed successfully")
+        models = train_area_models(new_df)
+        logger.info("Data loaded and models trained successfully")
     except Exception as e:
-        logger.error(f"Error reloading data: {str(e)}")
+        logger.error(f"Error loading data: {e}")
         raise
 
-def load_and_prepare_data(data):
-    df = pd.DataFrame(data)
-    df['Date'] = pd.to_datetime(df['Date'])
-    return df
-
-def get_menu_items(df):
-    return df.groupby('Category')['Item'].unique().to_dict()
-
-def train_area_models(df):
+def train_area_models(data: pd.DataFrame) -> Dict:
     models = {}
+    data = data.copy()
     
     def create_features(data):
         features = pd.DataFrame()
@@ -105,21 +100,24 @@ def train_area_models(df):
         features['DayOfWeek'] = data['Date'].dt.dayofweek
         features['DayOfMonth'] = data['Date'].dt.day
         return features
-    
-    for item in df['Item'].unique():
-        for order_type in ['Takeaway', 'Dining']:
-            item_data = df[(df['Item'] == item) & (df['Type of Order'] == order_type)]
-            if len(item_data) > 0:
-                X = create_features(item_data)
-                y = item_data['Orders']
-                
-                model = RandomForestRegressor(n_estimators=100, random_state=42)
-                model.fit(X, y)
-                
-                models[(item, order_type)] = model
-    
+
+    for area in data['Area'].unique():
+        area_data = data[data['Area'] == area]
+        for item in area_data['Item'].unique():
+            for order_type in ['Takeaway', 'Dining']:
+                filtered_data = area_data[
+                    (area_data['Item'] == item) & 
+                    (area_data['Type of Order'] == order_type)
+                ]
+                if not filtered_data.empty:
+                    X = create_features(filtered_data)
+                    y = filtered_data['Orders']
+                    model = RandomForestRegressor(n_estimators=100, random_state=42)
+                    model.fit(X, y)
+                    models[(area, item, order_type)] = model
     return models
 
+# Utility functions
 def get_date_range(target_date: str, range_type: str) -> List[datetime]:
     start_date = datetime.strptime(target_date, "%Y-%m-%d")
     
@@ -131,175 +129,81 @@ def get_date_range(target_date: str, range_type: str) -> List[datetime]:
     }
     
     delta = range_mappings[range_type]
-    end_date = start_date + delta
+    end_date = start_date + delta - timedelta(days=1)  # Subtract 1 day to ensure correct range
     
-    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-    return date_range
+    return pd.date_range(start=start_date, end=end_date, freq='D')
+    
+def predict_for_area_and_range(area: str, target_date: str, range_type: str) -> Optional[pd.DataFrame]:
+    if df is None or models is None:
+        raise HTTPException(status_code=500, detail="Data or models not loaded")
 
-def predict_for_area_and_range(df: pd.DataFrame, area: str, target_date: str, range_type: str) -> Optional[pd.DataFrame]:
-    area_data = df[df['Area'] == area].copy()
-    
-    if len(area_data) == 0:
-        return None
-    
-    menu_items = get_menu_items(df)
-    models = train_area_models(area_data)
     date_range = get_date_range(target_date, range_type)
-    
-    all_predictions = []
-    
-    for pred_date in date_range:
-        pred_features = pd.DataFrame({
-            'Year': [pred_date.year],
-            'Month': [pred_date.month],
-            'DayOfWeek': [pred_date.dayofweek],
-            'DayOfMonth': [pred_date.day]
-        })
-        
-        for category, items in menu_items.items():
-            for item in items:
-                for order_type in ['Takeaway', 'Dining']:
-                    model_key = (item, order_type)
-                    if model_key in models:
-                        prediction = models[model_key].predict(pred_features)[0]
-                        if prediction > 0:
-                            all_predictions.append({
-                                'Category': category,
-                                'Item': item,
-                                'Type_of_Order': order_type,
-                                'Predicted_Orders': max(0, round(prediction)),
-                                'Date': pred_date.strftime('%Y-%m-%d')
-                            })
-    
-    return pd.DataFrame(all_predictions)
+    area_data = df[df['Area'] == area]
+    if area_data.empty:
+        return None
 
-# Function to clean expired cache entries
-def clean_cache():
-    current_time = datetime.now()
-    keys_to_delete = [
-        key for key, value in cache.items()
-        if value['expiration'] < current_time
-    ]
-    for key in keys_to_delete:
-        del cache[key]
+    predictions = []
+    for date in date_range:
+        features = pd.DataFrame({
+            'Year': [date.year],
+            'Month': [date.month],
+            'DayOfWeek': [date.dayofweek],
+            'DayOfMonth': [date.day]
+        })
+        for item in area_data['Item'].unique():
+            for order_type in ['Takeaway', 'Dining']:
+                model_key = (area, item, order_type)
+                if model_key in models:
+                    prediction = models[model_key].predict(features)[0]
+                    if prediction > 0:
+                        predictions.append({
+                            "Category": area_data[area_data['Item'] == item]['Category'].iloc[0],
+                            "Item": item,
+                            "Type_of_Order": order_type,
+                            "Predicted_Orders": round(prediction),
+                            "Date": date.strftime("%Y-%m-%d")
+                        })
+    return pd.DataFrame(predictions)
 
 # Endpoints
-@app.get("/last_date")
-async def get_last_date():
-    """Get the most recent date in the dataset"""
-    if df is None:
-        raise HTTPException(status_code=500, detail="Data not loaded")
-    
-    last_date = df['Date'].max().strftime('%Y-%m-%d')
-    return {"last_date": last_date}
-
-@app.post("/reload-data")
-async def reload_data():
-    """Manually reload data from CSV file"""
-    try:
-        load_data()
-        return {"status": "Data reloaded successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reload data: {str(e)}")
-
-@app.get("/menu-items", response_model=MenuResponse)
-async def get_menu_items_endpoint():
-    """Get all menu items grouped by category"""
-    if df is None:
-        raise HTTPException(status_code=500, detail="Data not loaded")
-    
-    # Get menu items grouped by category
-    menu_dict = get_menu_items(df)
-    
-    # Convert numpy arrays to lists for JSON serialization
-    menu_dict = {k: v.tolist() for k, v in menu_dict.items()}
-    
-    # Count total items
-    total_items = sum(len(items) for items in menu_dict.values())
-    
-    return MenuResponse(
-        categories=menu_dict,
-        total_items=total_items
-    )
-
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    """Get predictions for a specific area and date range with caching"""
     if df is None:
         raise HTTPException(status_code=500, detail="Data not loaded")
     
-    # Generate a cache key
     cache_key = f"{request.area}_{request.target_date}_{request.range}"
+    if cache_key in cache and cache[cache_key]['expiration'] > datetime.now():
+        logger.info(f"Cache hit for {cache_key}")
+        return cache[cache_key]['data']
     
-    # Check the cache
-    if cache_key in cache:
-        cached_response = cache[cache_key]
-        if cached_response['expiration'] > datetime.now():
-            logger.info("Cache hit for key: %s", cache_key)
-            return cached_response['data']
-        else:
-            # Expired cache
-            del cache[cache_key]
+    logger.info(f"Cache miss for {cache_key}")
+    predictions_df = predict_for_area_and_range(request.area, request.target_date, request.range)
+    if predictions_df is None or predictions_df.empty:
+        raise HTTPException(status_code=404, detail=f"No data for area: {request.area}")
     
-    logger.info("Cache miss for key: %s", cache_key)
-    
-    # Perform the prediction
-    predictions_df = predict_for_area_and_range(
-        df, 
-        request.area, 
-        request.target_date, 
-        request.range
-    )
-    
-    if predictions_df is None:
-        raise HTTPException(status_code=404, detail=f"No data available for area: {request.area}")
-    
-    # Calculate date range
-    date_range = get_date_range(request.target_date, request.range)
-    date_range_dict = {
-        "start_date": date_range[0].strftime('%Y-%m-%d'),
-        "end_date": date_range[-1].strftime('%Y-%m-%d')
-    }
-    
-    # Calculate daily totals
     daily_totals = predictions_df.groupby('Date')['Predicted_Orders'].sum().to_dict()
-    daily_totals = {str(k): int(v) for k, v in daily_totals.items()}
-    
-    # Convert predictions to response format
-    predictions_list = predictions_df.to_dict('records')
-    total_orders = int(predictions_df['Predicted_Orders'].sum())
-    
     response = PredictionResponse(
-        predictions=predictions_list,
-        total_orders=total_orders,
+        predictions=predictions_df.to_dict("records"),
+        total_orders=int(predictions_df['Predicted_Orders'].sum()),
         area=request.area,
-        date_range=date_range_dict,
-        daily_totals=daily_totals
+        date_range={
+            "start_date": request.target_date,
+            "end_date": (datetime.strptime(request.target_date, "%Y-%m-%d") + timedelta(days=len(daily_totals)-1)).strftime("%Y-%m-%d"),
+        },
+        daily_totals=daily_totals,
     )
-    
-    # Store response in cache
-    cache[cache_key] = {
-        "data": response,
-        "expiration": datetime.now() + timedelta(hours=CACHE_EXPIRATION_HOURS)
-    }
-    
+    cache[cache_key] = {"data": response, "expiration": datetime.now() + timedelta(hours=CACHE_EXPIRATION_HOURS)}
     return response
-# Set up scheduler to reload data daily
+
 @app.on_event("startup")
-async def startup_event():
-    # Load initial data
-    load_data()
-    
-    # Schedule data reload
-    scheduler.add_job(
-        load_data,
-        trigger=CronTrigger(hour=0),  # Run at midnight
-        id='reload_data'
-    )
+async def on_startup():
+    with data_lock:
+        load_data()
+    scheduler.add_job(load_data, CronTrigger(hour=0), id="daily_reload")
     scheduler.start()
 
 @app.on_event("shutdown")
-async def shutdown_event():
+async def on_shutdown():
     scheduler.shutdown()
 
 if __name__ == "__main__":

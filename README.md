@@ -2,34 +2,8 @@
 
 A FastAPI-based service for predicting restaurant orders based on menu items, order types, and specific areas.
 
-## Endpoints
-
-### 1. `/last_date` [GET]
-- **Description**: Retrieve the most recent date in the dataset.
-- **Response**:
-  ```json
-  {
-      "last_date": "YYYY-MM-DD"
-  }
-  ```
-
-### 2. `/reload-data` [POST]
-- **Description**: Manually reload the data from the CSV file. Usually you don't need that, because it will automatically reload the data from table once a day.
-
-### 3. `/menu-items` [GET]
-- **Description**: Fetch all menu items grouped by category.
-- **Response**:
-  ```json
-  {
-      "categories": {
-          "Category1": ["Item1", "Item2"],
-          "Category2": ["Item3", "Item4"]
-      },
-      "total_items": 10
-  }
-  ```
-
-### 4. `/predict` [POST]
+## Endpoint(s)
+### 1. `/predict` [POST]
 - **Description**: Get predictions for a specific area and date.
 - **Request**:
   ```json
@@ -55,7 +29,7 @@ A FastAPI-based service for predicting restaurant orders based on menu items, or
   }
   ```
 
-### 5. `/docs` [GET]
+### 2. `/docs` [GET]
 - **Description**: Access the Swagger to explore available endpoints.
 
 
@@ -66,11 +40,11 @@ A FastAPI-based service for predicting restaurant orders based on menu items, or
 ### Option 1: Local Installation
 1. Install dependencies:
     ```bash
-    pip install fastapi uvicorn pandas numpy scikit-learn apscheduler
+    pip install -r requirements.txt
     ```
 2. Start the server:
     ```bash
-    uvicorn main:app --reload
+    python -m uvicorn main:app --reload
     ```
 3. Access the API at `http://127.0.0.1:8000`
 
