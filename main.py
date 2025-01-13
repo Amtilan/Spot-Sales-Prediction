@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -11,6 +11,8 @@ import numpy as np
 import uvicorn
 import logging
 from threading import Lock
+import shutil
+import os
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +46,7 @@ df = None
 models = None
 cache: Dict[str, Dict] = {}
 CACHE_EXPIRATION_HOURS = 24  # Cache expiration
+DATA_FILE = "the_burger_spot.csv" # Data file path
 
 # Pydantic models
 class PredictionRequest(BaseModel):
@@ -78,15 +81,25 @@ class MenuResponse(BaseModel):
     total_items: int
 
 # Data loading and preparation
-def load_data():
+class UploadResponse(BaseModel):
+    message: str
+    rows_processed: int
+
+def clear_cache():
+    global cache
+    cache = {}
+    logger.info("Cache cleared")
+
+def load_data(file_path: str = DATA_FILE):
     global df, models
     try:
-        logger.info("Reloading data...")
-        new_df = pd.read_csv("the_burger_spot.csv")
+        logger.info(f"Loading data from {file_path}")
+        new_df = pd.read_csv(file_path)
         new_df['Date'] = pd.to_datetime(new_df['Date'])
         df = new_df
         models = train_area_models(new_df)
-        logger.info("Data loaded and models trained successfully")
+        logger.info(f"Data loaded and models trained successfully: {len(df)} rows")
+        return len(df)
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         raise
@@ -171,7 +184,7 @@ def predict_for_area_and_range(area: str, target_date: str, range_type: str) -> 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
     if df is None:
-        raise HTTPException(status_code=500, detail="Data not loaded")
+        raise HTTPException(status_code=404, detail="Data not loaded")
     
     cache_key = f"{request.area}_{request.target_date}_{request.range}"
     if cache_key in cache and cache[cache_key]['expiration'] > datetime.now():
@@ -197,10 +210,44 @@ async def predict(request: PredictionRequest):
     cache[cache_key] = {"data": response, "expiration": datetime.now() + timedelta(hours=CACHE_EXPIRATION_HOURS)}
     return response
 
+@app.post("/upload", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+    
+    try:
+        with data_lock:
+            # Save uploaded file
+            with open(DATA_FILE, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            
+            # Clear cache and reload data
+            clear_cache()
+            rows_processed = load_data()
+            
+            return UploadResponse(
+                message="File uploaded and processed successfully",
+                rows_processed=rows_processed
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        file.file.close()
+
+
+@app.get("/areas")
+async def get_areas():
+    if df is None:
+        raise HTTPException(status_code=404, detail="Data not loaded")
+    return {"areas": sorted(df["Area"].unique().tolist())}
+
 @app.on_event("startup")
 async def on_startup():
     with data_lock:
-        load_data()
+        if os.path.exists(DATA_FILE):
+            load_data()
+        else:
+            logger.warning("No initial data file found")
     scheduler.add_job(load_data, CronTrigger(hour=0), id="daily_reload")
     scheduler.start()
 
