@@ -1,62 +1,86 @@
-# Restaurant Order Prediction API
+# API для прогноза заказов в ресторанах
 
-A FastAPI-based service for predicting restaurant orders based on menu items, order types, and specific areas.
+Сервис на основе FastAPI для предсказания заказов ресторанов, учитывая элементы меню, типы заказов и конкретные места.
 
-## Endpoint(s)
+## Эндпоинты
+
 ### 1. `/predict` [POST]
-- **Description**: Get predictions for a specific area and date.
-- **Request**:
+- **Описание**: Получение прогноза заказов для конкретного места и даты.
+- **Запрос**:
   ```json
   {
-      "area": "AreaName",
-      "target_date": "YYYY-MM-DD"
+      "area": "НазваниеМеста",
+      "target_date": "ГГГГ-ММ-ДД"
   }
   ```
-- **Response**:
+- **Ответ**:
   ```json
   {
       "predictions": [
           {
-              "Category": "CategoryName",
-              "Item": "ItemName",
-              "Type_of_Order": "Takeaway/Dining",
+              "Category": "НазваниеКатегории",
+              "Item": "НазваниеЕды",
+              "Type_of_Order": "Навынос/ВнутриЗала",
               "Predicted_Orders": 50
           }
       ],
       "total_orders": 100,
-      "area": "AreaName",
-      "target_date": "YYYY-MM-DD"
+      "area": "НазваниеМеста",
+      "target_date": "ГГГГ-ММ-ДД"
   }
   ```
 
-### 2. `/docs` [GET]
-- **Description**: Access the Swagger to explore available endpoints.
+### 2. `/upload` [POST]
+- **Описание**: Загрузка нового CSV-файла с данными.
+- **Запрос**:
+  - Файл с расширением `.csv`, переданный через форму (`multipart/form-data`).
+- **Ответ**:
+  ```json
+  {
+      "message": "File uploaded and processed successfully",
+      "rows_processed": 1000
+  }
+  ```
+- **Ошибки**:
+  - `400`: Если файл не является CSV.
+  - `500`: Ошибка при обработке файла.
 
+### 3. `/areas` [GET]
+- **Описание**: Получение списка доступных мест из загруженных данных.
+- **Ответ**:
+  ```json
+  {
+      "areas": ["Area1", "Area2", "Area3"]
+  }
+  ```
+- **Ошибки**:
+  - `404`: Если данные не загружены.
+
+### 4. `/docs` [GET]
+- **Описание**: Доступ к Swagger для изучения доступных эндпоинтов.
 
 ---
 
-## Running the Application
+## Запуск приложения
 
-### Option 1: Local Installation
-1. Install dependencies:
+### Вариант 1: Локальная установка
+1. Установите зависимости:
     ```bash
     pip install -r requirements.txt
     ```
-2. Start the server:
+2. Запустите сервер:
     ```bash
     python -m uvicorn main:app --reload
     ```
-3. Access the API at `http://127.0.0.1:8000`
+3. Доступ к API: `http://localhost:8000`
 
-### Option 2: Using Docker
-1. Build the image:
+### Вариант 2: Использование Docker
+1. Постройте образ:
     ```bash
     docker build -t fastapi-app .
     ```
-2. Run the container:
+2. Запустите контейнер:
     ```bash
     docker run -p 8000:8000 fastapi-app
     ```
-3. Access the API at `http://127.0.0.1:8000`
-
----
+3. Доступ к API: `http://localhost:8000`
