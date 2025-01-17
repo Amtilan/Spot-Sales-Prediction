@@ -4,13 +4,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sklearn.ensemble import RandomForestRegressor
 from typing import List, Optional, Dict, Literal
-from pydantic import BaseModel, validator
 from datetime import datetime, timedelta
+from pydantic import BaseModel
+from threading import Lock
 import pandas as pd
 import numpy as np
 import uvicorn
 import logging
-from threading import Lock
 import shutil
 import os
 
@@ -46,21 +46,12 @@ df = None
 models = None
 cache: Dict[str, Dict] = {}
 CACHE_EXPIRATION_HOURS = 24  # Cache expiration
-DATA_FILE = "the_burger_spot.csv" # Data file path
+DATA_FILE = "the_burger_spot.csv"  # Data file path
 
 # Pydantic models
 class PredictionRequest(BaseModel):
     area: str
-    target_date: str
     range: Literal["1d", "1w", "2w", "1m"]
-
-    @validator("target_date")
-    def validate_date(cls, v):
-        try:
-            datetime.strptime(v, "%Y-%m-%d")
-            return v
-        except ValueError:
-            raise ValueError("Invalid date format. Use YYYY-MM-DD")
 
 class PredictionItem(BaseModel):
     Category: str
@@ -80,11 +71,11 @@ class MenuResponse(BaseModel):
     categories: Dict[str, List[str]]
     total_items: int
 
-# Data loading and preparation
 class UploadResponse(BaseModel):
     message: str
     rows_processed: int
 
+# Utility functions
 def clear_cache():
     global cache
     cache = {}
@@ -132,23 +123,18 @@ def train_area_models(data: pd.DataFrame) -> Dict:
                     models[(area, item, order_type)] = model
     return models
 
-# Utility functions
-def get_date_range(target_date: str, range_type: str) -> List[datetime]:
-    start_date = datetime.strptime(target_date, "%Y-%m-%d")
-    
+def get_date_range(start_date: datetime, range_type: str) -> List[datetime]:
     range_mappings = {
         "1d": timedelta(days=1),
         "1w": timedelta(weeks=1),
         "2w": timedelta(weeks=2),
         "1m": timedelta(days=30)
     }
-    
     delta = range_mappings[range_type]
     end_date = start_date + delta - timedelta(days=1)  # Subtract 1 day to ensure correct range
-    
     return pd.date_range(start=start_date, end=end_date, freq='D')
-    
-def predict_for_area_and_range(area: str, target_date: str, range_type: str) -> Optional[pd.DataFrame]:
+
+def predict_for_area_and_range(area: str, target_date: datetime, range_type: str) -> Optional[pd.DataFrame]:
     if df is None or models is None:
         raise HTTPException(status_code=500, detail="Data or models not loaded")
 
@@ -180,30 +166,30 @@ def predict_for_area_and_range(area: str, target_date: str, range_type: str) -> 
                         })
     return pd.DataFrame(predictions)
 
-# Endpoints
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
     if df is None:
         raise HTTPException(status_code=404, detail="Data not loaded")
-    
-    cache_key = f"{request.area}_{request.target_date}_{request.range}"
+
+    target_date = datetime.now()  # Use the current date
+    cache_key = f"{request.area}_{target_date.strftime('%Y-%m-%d')}_{request.range}"
     if cache_key in cache and cache[cache_key]['expiration'] > datetime.now():
         logger.info(f"Cache hit for {cache_key}")
         return cache[cache_key]['data']
-    
+
     logger.info(f"Cache miss for {cache_key}")
-    predictions_df = predict_for_area_and_range(request.area, request.target_date, request.range)
+    predictions_df = predict_for_area_and_range(request.area, target_date, request.range)
     if predictions_df is None or predictions_df.empty:
         raise HTTPException(status_code=404, detail=f"No data for area: {request.area}")
-    
+
     daily_totals = predictions_df.groupby('Date')['Predicted_Orders'].sum().to_dict()
     response = PredictionResponse(
         predictions=predictions_df.to_dict("records"),
         total_orders=int(predictions_df['Predicted_Orders'].sum()),
         area=request.area,
         date_range={
-            "start_date": request.target_date,
-            "end_date": (datetime.strptime(request.target_date, "%Y-%m-%d") + timedelta(days=len(daily_totals)-1)).strftime("%Y-%m-%d"),
+            "start_date": target_date.strftime("%Y-%m-%d"),
+            "end_date": (target_date + timedelta(days=len(daily_totals)-1)).strftime("%Y-%m-%d"),
         },
         daily_totals=daily_totals,
     )
