@@ -28,6 +28,8 @@ scheduler = BackgroundScheduler()
 origins = [
     "http://localhost:3000",
     "https://localhost:3000",
+    "http://localhost:3001",
+    "https://localhost:3001",
     "https://spot-sales-prediction-frontend-a50dh7i6y-melsovezs-projects.vercel.app",
     "https://spot-sales-prediction-frontend.vercel.app"
 ]
